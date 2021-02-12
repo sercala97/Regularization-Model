@@ -1,0 +1,269 @@
+---
+title: 'Modelo NBA: regularización'
+author: "Sergio Cañón"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r setup, echo=FALSE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=FALSE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+```{r librerias}
+
+library(rsample)  # data splitting 
+library(glmnet)   # implementing regularized regression approaches
+library(dplyr)    # basic data manipulation procedures
+library(ggplot2)  # plotting
+library(janitor)
+library(magrittr) 
+library(here) # Comentar
+library(tidyverse)
+library(janitor) # Clean nnba
+library(skimr) # Beautiful Summarize
+library(magrittr) # Pipe operators
+library(corrplot) # Correlations
+library(ggcorrplot)  # Correlations
+library(PerformanceAnalytics) # Correlations
+library(leaps) # Model selection
+library(dplyr)
+library(GGally)
+library(car)
+library(kableExtra)
+library(magick)
+```
+
+# DATA IMPORT
+
+```{r}
+nba <- read.csv("nba.csv")
+pander::pander(head(nba))
+```
+
+# SUMMARIZE DATA
+
+```{r}
+skim <- skim(nba)
+pander::pander(summary(nba))
+
+```
+
+# DATA CLEANING
+
+Con `skim()` vemos que hay valores nulos asi qe ulso eliminamos.
+
+```{r}
+nba %<>% drop_na()
+duplicated(nba)  
+
+```
+
+Eliminamos las variables no vamos a usar y limpiamos el nombre a las que si
+
+```{r}
+
+nba %<>% clean_names()
+
+nba$player <- NULL
+nba$nba_country <- NULL
+nba$tm <- NULL
+
+names(nba)[names(nba) == "nba_draft_number"] <- "draft"
+
+
+```
+
+# DATA VISUALIZATION
+
+```{r}
+
+nba %>% 
+  gather(-salary, key = "var", value = "value") %>%
+  ggplot(aes(x=salary, y= value)) +
+  geom_jitter(size=0.2) +
+  geom_smooth(method = "lm")+
+  facet_wrap(~ var, scales = "free")+
+  theme_minimal()
+
+
+
+ggcorrplot(cor(nba),
+           type = "upper", 
+           tl.cex = 12,
+           lab_size = 2.1)
+
+
+
+
+```
+
+# MULTICOLINEALIDAD
+
+Por definción es: situación en la que exister una fuerte correlación entre variables explicativas del modelos
+
+```{r}
+
+vif_modelo <- lm(salary ~., nba)
+
+pander::pander(sqrt(vif(vif_modelo))> 2)
+
+
+```
+
+La funcion `vif()` nos indica la presencia de multicolinealidad de las variables dependientes. Un valor de `TRUE` es significado de multicolinealidad. Esta situación
+
+# DATA PARTITIONING
+
+```{r}
+
+set.seed(1234) 
+
+index<-sample(1:nrow(nba), 0.7*nrow(nba)) 
+
+nba_train <- nba[index,] # Create the training data 
+nba_test<-nba[-index,] # Create the test data
+
+#dividimos el train y els test por variable dependiente e independiente
+
+nba_train_x <- model.matrix(salary ~ ., nba_train)[,-1] 
+nba_train_y <- log(nba_train$salary) #he puesto sin log
+
+nba_test_x <- model.matrix(salary ~ ., nba_test)[,-1] 
+nba_test_y <- log(nba_test$salary) #he puesto sin log
+```
+
+# REGULARIZACIÓN
+
+Es una técnica que evita los parámetros de un el modelo se vuelve demasiado grande y los "encoge" a 0. El resultado de la regularización son modelos que, al hacer predicciones sobre nuevos datos, tienen menos varianza.
+
+\
+Tres técnicas de regularización particularmente conocidas y utilizadas para modelos lineales son los siguientes:
+
+1.  Ridge regression
+
+2.  Least absolute shrinkage and selection operator (LASSO)
+
+3.  Elastic net
+
+```{r}
+nba_lasso <- glmnet(x = nba_train_x, y = nba_train_y, alpha = 1)
+nba_elnet <- glmnet(x = nba_train_x, y = nba_train_y, alpha = 0.5)
+nba_ridge <- glmnet(x = nba_train_x, y = nba_train_y, alpha = 0)
+
+```
+
+```{r}
+
+plot(nba_lasso, xvar = "lambda")
+plot(nba_ridge, xvar = "lambda")
+plot(nba_elnet, xvar = "lambda")
+
+```
+
+## ALPHA ÓPTIMA: elastic net
+
+```{r}
+fold_id <- sample(1:10, size = length(nba_train_y), replace = TRUE)
+#Hacemos un grud que haga una busqueda por el rango de alphas 
+tuning_grid <- tibble::tibble(
+  alpha      = seq(0, 1, by = .1), #que vaya de 0.1 en 0.1
+  mse_min    = NA,
+  mse_1se    = NA,
+  lambda_min = NA,
+  lambda_1se = NA)
+
+for (i in seq_along(tuning_grid$alpha)) {
+  fit <- cv.glmnet(nba_train_x, nba_train_y, alpha = tuning_grid$alpha[i], 
+                   foldid = fold_id)
+  
+  # sacamos los MSE y los valores de lambda
+  tuning_grid$mse_min[i]    <- fit$cvm[fit$lambda == fit$lambda.min]
+  tuning_grid$mse_1se[i]    <- fit$cvm[fit$lambda == fit$lambda.1se]
+  tuning_grid$lambda_min[i] <- fit$lambda.min
+  tuning_grid$lambda_1se[i] <- fit$lambda.1se
+}
+
+pander::pander(tuning_grid)  #minimo lambda es 0.08810070 que coincide con un modelo LASSO
+
+```
+
+El modelo con menor `mse_min` es aquel con un `alpha` de 1 por lo que estaríamos hablando de un modelo LASSO.
+
+## LASSO
+
+```{r}
+
+lasso_cv <- cv.glmnet(x=nba_train_x,y=nba_train_y,alpha=1, nfolds = 200)
+lasso_cv
+lasso_cv_plot <- plot(lasso_cv)
+
+```
+
+```{r}
+# Información de CV en dataframe con tidy
+pander::pander(head(lasso_cv %>% tidy()))
+```
+
+```{r eval=TRUE,  echo=TRUE}
+
+lasso_lambda_opt <- lasso_cv$lambda.min
+lasso_lambda_opt
+```
+
+El `lambda.min` es aquel valor de lambda que da el mínimo `cvm` (media de los errores cruzados)
+
+```{r}
+lasso_opt<-glmnet(x=nba_train_x, # Matriz de regresores
+                   y=nba_train_y, #Vector de la variable a predecir
+                   alpha=1, # Indicador del tipo de regularizacion
+                   lambda = lasso_lambda_opt)
+
+pander::pander(lasso_opt %>% tidy())
+```
+
+El método de regularización LASSO tiene por característica la de eliminaro variables simplificando el modelo y así quitar la multicolinealidad. Las variables que LASSO ha mantenido son: `draft`, `age`, `mp` , `drb` y `ws`.
+
+Gráficamente lo vemos aquí:
+
+```{r}
+tuning_grid %>%
+  mutate(se = mse_1se - mse_min) %>%
+  ggplot(aes(alpha, mse_min)) +
+  geom_line(size = 2) +
+  geom_ribbon(aes(ymax = mse_min + se, ymin = mse_min - se), alpha = .25) +
+  ggtitle("MSE ± one standard error")
+```
+
+Se aprecia que el mínimo `mse_min` coincide con el `alpha = 1` (LASSO). Por lo tanto el modelos Lasso es el qeu tiene menor error.
+
+# MODEL TESTING
+
+```{r , eval=TRUE,  echo=TRUE}
+
+lasso_final <- glmnet(nba_train_x, nba_train_y, alpha = 1.0,
+                            lambda = lasso_cv$lambda.min)
+
+pred <- predict(lasso_final, s = lasso_cv$lambda.min, nba_test_x)
+
+sqrt(mean((nba_test_y - pred)^2))
+
+```
+
+```{r}
+plot((nba_test_y - pred)^2, type="l")
+```
